@@ -175,6 +175,8 @@
     </div>
     <div id="lock-recovery-display" style="display:none">
       <p class="recovery-code" id="recovery-code-text"></p>
+      <button class="btn-cancel" style="width:100%;margin-bottom:8px;" onclick="copyRecoveryCode()">Copiar código</button>
+      <button class="btn-cancel" style="width:100%;margin-bottom:8px;" onclick="emailRecoveryCode()">Enviármelo por email</button>
       <button class="btn-add" onclick="confirmRecoverySaved()">Ya lo guardé, continuar</button>
     </div>
     <p class="lock-error" id="lock-error"></p>
@@ -416,6 +418,26 @@ function confirmRecoverySaved(){
   document.getElementById('lock-recovery-display').style.display = 'none';
   document.getElementById('lock-form').style.display = '';
   unlockApp();
+}
+function copyRecoveryCode(){
+  const code = document.getElementById('recovery-code-text').textContent;
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(code).then(()=>alert('Código copiado.')).catch(()=>alert('No se pudo copiar. Cópialo a mano.'));
+  } else {
+    alert('No se pudo copiar automáticamente. Cópialo a mano.');
+  }
+}
+function emailRecoveryCode(){
+  const code = document.getElementById('recovery-code-text').textContent;
+  let email = localStorage.getItem('miEmailParaCodigo') || '';
+  if(!email){
+    email = prompt('¿A qué email quieres enviarte el código? (solo abre tu app de correo; no se guarda en la base de datos)') || '';
+    if(email) localStorage.setItem('miEmailParaCodigo', email);
+  }
+  if(!email) return;
+  const subject = encodeURIComponent('Código de recuperación — Mis cosas Brisbane');
+  const body = encodeURIComponent('Guarda este código en un lugar seguro. Es la única forma de recuperar tus datos si olvidas la contraseña:\n\n' + code);
+  window.location.href = 'mailto:' + encodeURIComponent(email) + '?subject=' + subject + '&body=' + body;
 }
 
 async function handleLockSubmit(){
