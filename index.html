@@ -154,6 +154,11 @@
   .lock-box input{width:100%;margin-bottom:10px;text-align:center;}
   .lock-box .btn-add{width:100%;}
   .lock-error{color:var(--rust);font-size:0.82rem;margin-top:10px;min-height:1em;}
+  .lock-link{font-size:0.85rem;margin-top:10px;}
+  .lock-link a{color:var(--river);cursor:pointer;text-decoration:underline;}
+  .recovery-code{font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;font-size:1.15rem;font-weight:700;background:#FAFAF7;border:1px solid var(--line);border-radius:8px;padding:14px;letter-spacing:1px;word-break:break-all;margin-bottom:14px;}
+  .footer-link{text-align:center;margin-top:6px;}
+  .footer-link a{font-size:0.78rem;color:var(--ink-soft);text-decoration:underline;cursor:pointer;}
 </style>
 </head>
 <body>
@@ -161,10 +166,31 @@
   <div class="lock-box">
     <h1>Mis cosas — Brisbane</h1>
     <p id="lock-msg">Cargando...</p>
-    <input type="password" id="lock-pass" placeholder="Contraseña" autocomplete="current-password" onkeydown="if(event.key==='Enter') handleLockSubmit()">
-    <input type="password" id="lock-pass2" placeholder="Repite la contraseña" style="display:none" autocomplete="new-password" onkeydown="if(event.key==='Enter') handleLockSubmit()">
-    <button class="btn-add" id="lock-btn" onclick="handleLockSubmit()">Entrar</button>
+    <div id="lock-form">
+      <input type="password" id="lock-pass" placeholder="Contraseña" autocomplete="current-password" onkeydown="if(event.key==='Enter') handleLockSubmit()">
+      <input type="password" id="lock-pass2" placeholder="Repite la contraseña" style="display:none" autocomplete="new-password" onkeydown="if(event.key==='Enter') handleLockSubmit()">
+      <button class="btn-add" id="lock-btn" onclick="handleLockSubmit()">Entrar</button>
+      <p class="lock-link" id="lock-forgot" style="display:none"><a onclick="showRecoverScreen()">¿Olvidaste tu contraseña?</a></p>
+      <p class="lock-link" id="lock-back" style="display:none"><a onclick="showUnlockUI()">Volver</a></p>
+    </div>
+    <div id="lock-recovery-display" style="display:none">
+      <p class="recovery-code" id="recovery-code-text"></p>
+      <button class="btn-add" onclick="confirmRecoverySaved()">Ya lo guardé, continuar</button>
+    </div>
     <p class="lock-error" id="lock-error"></p>
+  </div>
+</div>
+
+<div class="lock-overlay" id="cp-overlay" style="display:none">
+  <div class="lock-box">
+    <h1>Cambiar contraseña</h1>
+    <p>Introduce tu contraseña actual y la nueva.</p>
+    <input type="password" id="cp-old" placeholder="Contraseña actual" autocomplete="current-password">
+    <input type="password" id="cp-new" placeholder="Nueva contraseña" autocomplete="new-password">
+    <input type="password" id="cp-new2" placeholder="Repite la nueva contraseña" autocomplete="new-password">
+    <button class="btn-add" onclick="submitChangePassword()">Guardar</button>
+    <button class="btn-cancel" style="margin-top:8px;width:100%;" onclick="closeChangePassword()">Cancelar</button>
+    <p class="lock-error" id="cp-error"></p>
   </div>
 </div>
 <div class="wrap" id="app-wrap" style="display:none">
@@ -228,6 +254,7 @@
   </div>
 
   <div class="status" id="status">Conectando...</div>
+  <p class="footer-link"><a onclick="openChangePassword()">Cambiar contraseña</a></p>
 </div>
 
 <!-- Firebase (compat SDK, simple script-tag usage) -->
@@ -263,120 +290,245 @@ function setStatus(msg){ document.getElementById('status').textContent = msg; }
 
 /* ================== CIFRADO Y CONTRASEÑA DE PERFIL ==================
    Los textos sensibles (nombres, referencias, notas, el PDF) se cifran en
-   el navegador con AES-GCM usando una clave derivada de tu contraseña
-   (PBKDF2). Firestore solo guarda el texto ya cifrado: si alguien accede
-   directamente a la base de datos sin tu contraseña, no puede leer nada.
-   La contraseña nunca se guarda; solo un "check" cifrado para verificarla. */
+   el navegador con AES-GCM usando una "clave de datos" (DEK) aleatoria.
+   Esa DEK se guarda envuelta (cifrada) de DOS formas distintas en Firestore:
+   una con una clave derivada de tu contraseña (PBKDF2), y otra con una clave
+   derivada de un código de recuperación que solo tú guardas. Así puedes
+   cambiar la contraseña sin re-cifrar tus datos, y recuperarlos si la
+   olvidas, sin que la contraseña ni el código se guarden nunca en ningún
+   sitio — ni en Firestore, ni en el código, ni fuera de tu cabeza. */
 let cryptoKey = null;
 let lockMode = 'checking';
+let pendingDekBytes = null; // DEK sin envolver, mientras se pide una contraseña nueva tras recuperar
 
 function b64FromBytes(bytes){ let s=''; for(let i=0;i<bytes.length;i++) s+=String.fromCharCode(bytes[i]); return btoa(s); }
 function bytesFromB64(b64){ const bin=atob(b64); const arr=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i); return arr; }
 
-async function deriveKey(password, saltB64){
+async function deriveKey(secret, saltB64){
   const salt = bytesFromB64(saltB64);
-  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations:150000, hash:'SHA-256'}, base, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations:150000, hash:'SHA-256'}, base, {name:'AES-GCM', length:256}, true, ['encrypt','decrypt']);
 }
-async function encStr(key, text){
+async function wrapBytes(key, rawBytes){
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const buf = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, new TextEncoder().encode(text || ''));
+  const buf = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, rawBytes);
   const out = new Uint8Array(iv.length + buf.byteLength);
   out.set(iv, 0); out.set(new Uint8Array(buf), iv.length);
   return b64FromBytes(out);
 }
-async function decStr(key, payload){
-  if(!payload) return '';
+async function unwrapBytes(key, payload){
   const bytes = bytesFromB64(payload);
   const iv = bytes.slice(0,12), data = bytes.slice(12);
   const buf = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, data);
-  return new TextDecoder().decode(buf);
+  return new Uint8Array(buf);
 }
+async function encStr(key, text){ return wrapBytes(key, new TextEncoder().encode(text || '')); }
+async function decStr(key, payload){
+  if(!payload) return '';
+  return new TextDecoder().decode(await unwrapBytes(key, payload));
+}
+async function importDek(dekBytes){
+  return crypto.subtle.importKey('raw', dekBytes, {name:'AES-GCM'}, true, ['encrypt','decrypt']);
+}
+function generateRecoveryCode(){
+  const alphabet = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'; // sin 0,1,I,L,O para evitar confusiones al escribirlo
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  let code = '';
+  for(let i=0;i<16;i++){
+    code += alphabet[bytes[i] % alphabet.length];
+    if(i % 4 === 3 && i !== 15) code += '-';
+  }
+  return code;
+}
+function normalizeCode(s){ return s.trim().toUpperCase().replace(/\s+/g,''); }
 
 function showLockError(msg){ document.getElementById('lock-error').textContent = msg; }
 
 async function initLock(){
   let profile = null;
   try{ profile = await fsGet('profile'); }catch(e){}
-  if(profile && profile.salt && profile.check){
-    lockMode = 'unlock';
-    document.getElementById('lock-msg').textContent = 'Introduce tu contraseña para continuar.';
-    document.getElementById('lock-pass2').style.display = 'none';
+  if(profile && (profile.v === 2 || (profile.salt && profile.check))){
+    showUnlockUI();
   } else {
-    lockMode = 'setup';
-    document.getElementById('lock-msg').textContent = 'Primera vez: crea una contraseña para proteger tus datos.';
-    document.getElementById('lock-pass2').style.display = '';
+    showSetupUI();
   }
+}
+
+function showUnlockUI(){
+  lockMode = 'unlock';
+  document.getElementById('lock-msg').textContent = 'Introduce tu contraseña para continuar.';
+  document.getElementById('lock-pass').value = '';
+  document.getElementById('lock-pass').placeholder = 'Contraseña';
+  document.getElementById('lock-pass2').style.display = 'none';
+  document.getElementById('lock-forgot').style.display = '';
+  document.getElementById('lock-back').style.display = 'none';
+  document.getElementById('lock-form').style.display = '';
+  document.getElementById('lock-recovery-display').style.display = 'none';
+  document.getElementById('lock-btn').textContent = 'Entrar';
+  showLockError('');
+}
+function showSetupUI(){
+  lockMode = 'setup';
+  document.getElementById('lock-msg').textContent = 'Primera vez: crea una contraseña para proteger tus datos.';
+  document.getElementById('lock-pass').value = '';
+  document.getElementById('lock-pass').placeholder = 'Contraseña';
+  document.getElementById('lock-pass2').style.display = '';
+  document.getElementById('lock-pass2').value = '';
+  document.getElementById('lock-forgot').style.display = 'none';
+  document.getElementById('lock-back').style.display = 'none';
+  document.getElementById('lock-form').style.display = '';
+  document.getElementById('lock-recovery-display').style.display = 'none';
+  document.getElementById('lock-btn').textContent = 'Crear contraseña';
+  showLockError('');
+}
+function showRecoverScreen(){
+  lockMode = 'recover';
+  document.getElementById('lock-msg').textContent = 'Escribe tu código de recuperación (el que guardaste al crear la contraseña).';
+  document.getElementById('lock-pass').value = '';
+  document.getElementById('lock-pass').placeholder = 'Código de recuperación';
+  document.getElementById('lock-pass2').style.display = 'none';
+  document.getElementById('lock-forgot').style.display = 'none';
+  document.getElementById('lock-back').style.display = '';
+  document.getElementById('lock-btn').textContent = 'Verificar código';
+  showLockError('');
+}
+function showSetNewPasswordScreen(){
+  lockMode = 'setnew';
+  document.getElementById('lock-msg').textContent = 'Código correcto. Crea una nueva contraseña.';
+  document.getElementById('lock-pass').value = '';
+  document.getElementById('lock-pass').placeholder = 'Nueva contraseña';
+  document.getElementById('lock-pass2').style.display = '';
+  document.getElementById('lock-pass2').value = '';
+  document.getElementById('lock-forgot').style.display = 'none';
+  document.getElementById('lock-back').style.display = 'none';
+  document.getElementById('lock-btn').textContent = 'Guardar nueva contraseña';
+  showLockError('');
+}
+function showRecoveryScreen(code){
+  lockMode = 'showcode';
+  document.getElementById('lock-msg').textContent = 'Guarda este código en un lugar seguro (gestor de contraseñas, papel...). Es la ÚNICA forma de recuperar tus datos si olvidas la contraseña, y no se volverá a mostrar.';
+  document.getElementById('lock-form').style.display = 'none';
+  document.getElementById('recovery-code-text').textContent = code;
+  document.getElementById('lock-recovery-display').style.display = '';
+  showLockError('');
+}
+function confirmRecoverySaved(){
+  document.getElementById('lock-recovery-display').style.display = 'none';
+  document.getElementById('lock-form').style.display = '';
+  unlockApp();
 }
 
 async function handleLockSubmit(){
   const pass = document.getElementById('lock-pass').value;
-  if(!pass){ showLockError('Escribe una contraseña.'); return; }
   showLockError('');
   document.getElementById('lock-btn').disabled = true;
   try{
     if(lockMode === 'setup'){
       const pass2 = document.getElementById('lock-pass2').value;
-      if(pass.length < 6){ showLockError('Usa al menos 6 caracteres.'); return; }
+      if(!pass || pass.length < 6){ showLockError('Usa al menos 6 caracteres.'); return; }
       if(pass !== pass2){ showLockError('Las contraseñas no coinciden.'); return; }
-      const salt = crypto.getRandomValues(new Uint8Array(16));
-      const saltB64 = b64FromBytes(salt);
-      const key = await deriveKey(pass, saltB64);
-      const check = await encStr(key, 'ok');
-      await fsSet('profile', {salt: saltB64, check});
-      cryptoKey = key;
-      await migratePlaintextData(key);
-      unlockApp();
-    } else {
+      const dekBytes = crypto.getRandomValues(new Uint8Array(32));
+      cryptoKey = await importDek(dekBytes);
+      const passSalt = b64FromBytes(crypto.getRandomValues(new Uint8Array(16)));
+      const kek1 = await deriveKey(pass, passSalt);
+      const passWrappedKey = await wrapBytes(kek1, dekBytes);
+      const recoveryCode = generateRecoveryCode();
+      const recoverySalt = b64FromBytes(crypto.getRandomValues(new Uint8Array(16)));
+      const kek2 = await deriveKey(recoveryCode, recoverySalt);
+      const recoveryWrappedKey = await wrapBytes(kek2, dekBytes);
+      await fsSet('profile', {v:2, passSalt, passWrappedKey, recoverySalt, recoveryWrappedKey});
+      showRecoveryScreen(recoveryCode);
+    } else if(lockMode === 'unlock'){
+      if(!pass){ showLockError('Escribe tu contraseña.'); return; }
       const profile = await fsGet('profile');
-      try{
-        const key = await deriveKey(pass, profile.salt);
-        const check = await decStr(key, profile.check);
-        if(check !== 'ok') throw new Error('bad');
-        cryptoKey = key;
-        unlockApp();
-      }catch(e){
-        showLockError('Contraseña incorrecta.');
+      if(profile.v === 2){
+        try{
+          const kek1 = await deriveKey(pass, profile.passSalt);
+          const dekBytes = await unwrapBytes(kek1, profile.passWrappedKey);
+          cryptoKey = await importDek(dekBytes);
+          unlockApp();
+        }catch(e){ showLockError('Contraseña incorrecta.'); }
+      } else {
+        // Perfil antiguo (sin código de recuperación): verificamos y lo actualizamos al nuevo esquema
+        // reutilizando exactamente la misma clave, sin tocar los datos ya cifrados con ella.
+        try{
+          const oldKey = await deriveKey(pass, profile.salt);
+          const check = await decStr(oldKey, profile.check);
+          if(check !== 'ok') throw new Error('bad');
+          const dekBytes = new Uint8Array(await crypto.subtle.exportKey('raw', oldKey));
+          cryptoKey = await importDek(dekBytes);
+          const passSalt = b64FromBytes(crypto.getRandomValues(new Uint8Array(16)));
+          const kek1 = await deriveKey(pass, passSalt);
+          const passWrappedKey = await wrapBytes(kek1, dekBytes);
+          const recoveryCode = generateRecoveryCode();
+          const recoverySalt = b64FromBytes(crypto.getRandomValues(new Uint8Array(16)));
+          const kek2 = await deriveKey(recoveryCode, recoverySalt);
+          const recoveryWrappedKey = await wrapBytes(kek2, dekBytes);
+          await fsSet('profile', {v:2, passSalt, passWrappedKey, recoverySalt, recoveryWrappedKey});
+          showRecoveryScreen(recoveryCode);
+        }catch(e){ showLockError('Contraseña incorrecta.'); }
       }
+    } else if(lockMode === 'recover'){
+      if(!pass){ showLockError('Escribe tu código de recuperación.'); return; }
+      try{
+        const profile = await fsGet('profile');
+        const kek2 = await deriveKey(normalizeCode(pass), profile.recoverySalt);
+        pendingDekBytes = await unwrapBytes(kek2, profile.recoveryWrappedKey);
+        showSetNewPasswordScreen();
+      }catch(e){ showLockError('Código incorrecto.'); }
+    } else if(lockMode === 'setnew'){
+      const pass2 = document.getElementById('lock-pass2').value;
+      if(!pass || pass.length < 6){ showLockError('Usa al menos 6 caracteres.'); return; }
+      if(pass !== pass2){ showLockError('Las contraseñas no coinciden.'); return; }
+      const dekBytes = pendingDekBytes;
+      cryptoKey = await importDek(dekBytes);
+      const passSalt = b64FromBytes(crypto.getRandomValues(new Uint8Array(16)));
+      const kek1 = await deriveKey(pass, passSalt);
+      const passWrappedKey = await wrapBytes(kek1, dekBytes);
+      const profile = await fsGet('profile');
+      await fsSet('profile', {...profile, passSalt, passWrappedKey});
+      pendingDekBytes = null;
+      unlockApp();
     }
   } finally {
     document.getElementById('lock-btn').disabled = false;
   }
 }
 
-async function migratePlaintextData(key){
-  // Cifra en el sitio los datos que ya existían en Firestore de antes de activar el cifrado.
+/* ================== CAMBIAR CONTRASEÑA (ya dentro de la app) ================== */
+function openChangePassword(){
+  document.getElementById('cp-old').value = '';
+  document.getElementById('cp-new').value = '';
+  document.getElementById('cp-new2').value = '';
+  document.getElementById('cp-error').textContent = '';
+  document.getElementById('cp-overlay').style.display = 'flex';
+}
+function closeChangePassword(){
+  document.getElementById('cp-overlay').style.display = 'none';
+}
+async function submitChangePassword(){
+  const oldPass = document.getElementById('cp-old').value;
+  const newPass = document.getElementById('cp-new').value;
+  const newPass2 = document.getElementById('cp-new2').value;
+  const errEl = document.getElementById('cp-error');
+  errEl.textContent = '';
+  if(!oldPass || !newPass){ errEl.textContent = 'Rellena todos los campos.'; return; }
+  if(newPass.length < 6){ errEl.textContent = 'La nueva contraseña debe tener al menos 6 caracteres.'; return; }
+  if(newPass !== newPass2){ errEl.textContent = 'Las contraseñas nuevas no coinciden.'; return; }
   try{
-    const tdata = await fsGet('tasks');
-    if(tdata && tdata.items && tdata.items.length){
-      const encItems = [];
-      for(const t of tdata.items){
-        encItems.push({...t, titulo: await encStr(key, t.titulo||''), notas: await encStr(key, t.notas||'')});
-      }
-      await fsSet('tasks', {items: encItems});
-    }
-  }catch(e){}
-  try{
-    const sdata = await fsGet('services');
-    if(sdata && sdata.items && sdata.items.length){
-      const encItems = [];
-      for(const s of sdata.items){
-        encItems.push({...s,
-          nombre: await encStr(key, s.nombre||''),
-          proveedor: await encStr(key, s.proveedor||''),
-          referencia: await encStr(key, s.referencia||''),
-          notas: await encStr(key, s.notas||'')
-        });
-      }
-      await fsSet('services', {items: encItems});
-    }
-  }catch(e){}
-  try{
-    const pdata = await fsGet('pdf');
-    if(pdata && pdata.b64){
-      await fsSet('pdf', {b64: await encStr(key, pdata.b64), filename: pdata.filename || PDF_FILENAME});
-    }
-  }catch(e){}
+    const profile = await fsGet('profile');
+    const kek1old = await deriveKey(oldPass, profile.passSalt);
+    await unwrapBytes(kek1old, profile.passWrappedKey); // lanza error si la contraseña actual está mal
+    const dekBytes = new Uint8Array(await crypto.subtle.exportKey('raw', cryptoKey));
+    const newSalt = b64FromBytes(crypto.getRandomValues(new Uint8Array(16)));
+    const kek1new = await deriveKey(newPass, newSalt);
+    const newWrapped = await wrapBytes(kek1new, dekBytes);
+    await fsSet('profile', {...profile, passSalt: newSalt, passWrappedKey: newWrapped});
+    closeChangePassword();
+    alert('Contraseña actualizada correctamente.');
+  }catch(e){
+    errEl.textContent = 'La contraseña actual no es correcta.';
+  }
 }
 
 function unlockApp(){
