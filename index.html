@@ -159,6 +159,17 @@
   .recovery-code{font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;font-size:1.15rem;font-weight:700;background:#FAFAF7;border:1px solid var(--line);border-radius:8px;padding:14px;letter-spacing:1px;word-break:break-all;margin-bottom:14px;}
   .footer-link{text-align:center;margin-top:6px;}
   .footer-link a{font-size:0.78rem;color:var(--ink-soft);text-decoration:underline;cursor:pointer;}
+
+  .p-summary{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:14px;}
+  .p-total{font-size:1.15rem;font-weight:700;margin:0 0 8px;}
+  .p-total span{color:var(--river);}
+  .p-breakdown{display:flex;flex-wrap:wrap;gap:6px;}
+  .p-cat-chip{font-size:0.74rem;font-weight:600;background:var(--jacaranda-soft);color:var(--jacaranda);padding:3px 9px;border-radius:20px;}
+  .purchase{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--line);border-radius:9px;padding:10px 12px;margin-bottom:8px;}
+  .p-body{flex:1;min-width:0;}
+  .p-nombre{font-size:0.94rem;font-weight:600;margin:0;}
+  .p-meta{font-size:0.78rem;color:var(--ink-soft);margin-top:2px;}
+  .p-precio{font-size:0.98rem;font-weight:700;flex:0 0 auto;}
 </style>
 </head>
 <body>
@@ -204,6 +215,7 @@
   <div class="tabs">
     <button class="tab active" id="tab-servicios" onclick="showPanel('servicios')">Mis servicios</button>
     <button class="tab" id="tab-gestiones" onclick="showPanel('gestiones')">Gestiones</button>
+    <button class="tab" id="tab-compras" onclick="showPanel('compras')">Compras</button>
   </div>
 
   <div id="panel-servicios">
@@ -253,6 +265,36 @@
       </div>
     </div>
     <div id="lists"></div>
+  </div>
+
+  <div id="panel-compras" style="display:none;">
+    <div class="add-box">
+      <div class="add-row">
+        <input name="p-nombre" placeholder="Artículo (ej: Detergente, Maquinilla)">
+        <select name="p-categoria">
+          <option value="Alimentación">Alimentación</option>
+          <option value="Higiene">Higiene</option>
+          <option value="Limpieza">Limpieza</option>
+          <option value="Hogar">Hogar</option>
+          <option value="Farmacia">Farmacia</option>
+          <option value="Ropa">Ropa</option>
+          <option value="Transporte">Transporte</option>
+          <option value="Ocio">Ocio</option>
+          <option value="Otro">Otro</option>
+        </select>
+      </div>
+      <div class="add-row">
+        <input name="p-precio" type="number" step="0.01" min="0" placeholder="Precio ($)" style="flex:0 0 120px;">
+        <input name="p-tienda" placeholder="Tienda (ej: Coles)">
+        <input name="p-fecha" type="date">
+      </div>
+      <div class="add-row">
+        <input name="p-notas" placeholder="Notas (opcional)">
+        <button class="btn-add" onclick="addPurchase()">Agregar</button>
+      </div>
+    </div>
+    <div id="purchase-summary"></div>
+    <div id="purchase-list"></div>
   </div>
 
   <div class="status" id="status">Conectando...</div>
@@ -765,18 +807,86 @@ async function openStoredPdf(){
   }catch(e){ alert('No se pudo abrir el PDF.'); }
 }
 
+/* ================== COMPRAS (registro económico, sin cifrar) ================== */
+let purchases = [];
+const SEED_PURCHASES = [];
+
+function puid(){ return 'p' + Date.now() + Math.random().toString(36).slice(2,7); }
+
+async function loadPurchases(){
+  try{
+    const data = await fsGet('purchases');
+    if(data && data.items){ purchases = data.items; }
+    else { purchases = SEED_PURCHASES.slice(); await savePurchases(); }
+  }catch(e){ purchases = SEED_PURCHASES.slice(); }
+  renderPurchases();
+}
+async function savePurchases(){
+  setStatus('Guardando...');
+  try{ await fsSet('purchases', {items: purchases}); setStatus('Guardado ✓'); }
+  catch(e){ setStatus('Error al guardar.'); }
+}
+function addPurchase(){
+  const nombre = document.querySelector('[name="p-nombre"]').value.trim();
+  if(!nombre) return;
+  const categoria = document.querySelector('[name="p-categoria"]').value;
+  const precio = parseFloat(document.querySelector('[name="p-precio"]').value) || 0;
+  const tienda = document.querySelector('[name="p-tienda"]').value.trim();
+  const fecha = document.querySelector('[name="p-fecha"]').value || new Date().toISOString().slice(0,10);
+  const notas = document.querySelector('[name="p-notas"]').value.trim();
+  purchases.unshift({id: puid(), nombre, categoria, precio, tienda, fecha, notas, created: Date.now()});
+  ['p-nombre','p-tienda','p-notas'].forEach(n => document.querySelector('[name="'+n+'"]').value = '');
+  document.querySelector('[name="p-precio"]').value = '';
+  document.querySelector('[name="p-fecha"]').value = '';
+  savePurchases(); renderPurchases();
+}
+function delPurchase(id){ purchases = purchases.filter(x=>x.id!==id); savePurchases(); renderPurchases(); }
+
+function renderPurchases(){
+  const summaryEl = document.getElementById('purchase-summary');
+  const listEl = document.getElementById('purchase-list');
+  if(purchases.length===0){
+    summaryEl.innerHTML = '';
+    listEl.innerHTML = '<div class="empty">No hay compras registradas todavía.</div>';
+    setStatus('');
+    return;
+  }
+  const total = purchases.reduce((sum,p)=>sum+(p.precio||0), 0);
+  const byCat = {};
+  purchases.forEach(p => { byCat[p.categoria] = (byCat[p.categoria]||0) + (p.precio||0); });
+  const chips = Object.keys(byCat).sort((a,b)=>byCat[b]-byCat[a])
+    .map(cat => '<span class="p-cat-chip">'+escapeHtml(cat)+': $'+byCat[cat].toFixed(2)+'</span>').join('');
+  summaryEl.innerHTML = '<div class="p-summary"><p class="p-total">Total gastado: <span>$'+total.toFixed(2)+'</span> ('+purchases.length+' artículos)</p><div class="p-breakdown">'+chips+'</div></div>';
+
+  const sorted = purchases.slice().sort((a,b)=> (b.fecha||'').localeCompare(a.fecha||'') || b.created-a.created);
+  listEl.innerHTML = sorted.map(p => {
+    const fechaLabel = p.fecha ? new Date(p.fecha+'T00:00:00').toLocaleDateString('es-ES',{day:'numeric',month:'short'}) : '';
+    const metaParts = [fechaLabel, p.tienda].filter(Boolean).join(' · ');
+    return '<div class="purchase">'
+      + '<div class="p-body"><p class="p-nombre">'+escapeHtml(p.nombre)+'</p>'
+      + '<div class="p-meta"><span class="badge b-cat">'+escapeHtml(p.categoria)+'</span>'+(metaParts?' '+escapeHtml(metaParts):'')+'</div>'
+      + (p.notas ? '<p class="t-notes">'+escapeHtml(p.notas)+'</p>' : '')
+      + '</div>'
+      + '<span class="p-precio">$'+(p.precio||0).toFixed(2)+'</span>'
+      + '<button class="del" onclick="delPurchase(\''+p.id+'\')">✕</button></div>';
+  }).join('');
+  setStatus('');
+}
+
 /* ================== Tabs & init ================== */
 function showPanel(which){
-  const isServ = which === 'servicios';
-  document.getElementById('panel-servicios').style.display = isServ ? '' : 'none';
-  document.getElementById('panel-gestiones').style.display = isServ ? 'none' : '';
-  document.getElementById('tab-servicios').classList.toggle('active', isServ);
-  document.getElementById('tab-gestiones').classList.toggle('active', !isServ);
+  document.getElementById('panel-servicios').style.display = which==='servicios' ? '' : 'none';
+  document.getElementById('panel-gestiones').style.display = which==='gestiones' ? '' : 'none';
+  document.getElementById('panel-compras').style.display = which==='compras' ? '' : 'none';
+  document.getElementById('tab-servicios').classList.toggle('active', which==='servicios');
+  document.getElementById('tab-gestiones').classList.toggle('active', which==='gestiones');
+  document.getElementById('tab-compras').classList.toggle('active', which==='compras');
 }
 
 function boot(){
   loadTasks();
   loadServices();
+  loadPurchases();
   ensurePdfStored();
 }
 initLock();
